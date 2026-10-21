@@ -1,0 +1,56 @@
+# Radar d'actu : toutes les 10 minutes (dépôt public → minutes GitHub Actions gratuites et illimitées).
+# Secret requis : AGENT_TOKEN = jeton GitHub fine-grained limité au dépôt de production, permission Actions: Read and write.
+# Variable facultative : CIBLE = dépôt de production (sinon radar.config.json → "cible").
+name: Radar actu
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    # Quand le radar tourne sur le PC (toutes les 2 min), celui-ci se met en veille : variable RADAR_SUR_PC = true.
+    if: vars.RADAR_SUR_PC != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mémoire des infos déjà vues : gardée dans le cache (pas de commit toutes les 10 minutes).
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: radar-${{ github.run_id }}
+          restore-keys: radar-
+
+      - name: Chercher une info chaude
+        env:
+          AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
+          CIBLE: ${{ vars.CIBLE }}
+        run: python3 radar.py
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: radar-${{ github.run_id }}
+
+      # GitHub suspend les tâches planifiées d'un dépôt public sans activité pendant 60 jours : un commit par jour suffit.
+      - name: Signe de vie quotidien
+        run: |
+          J=$(date -u +%F)
+          [ "$(cat heartbeat.txt 2>/dev/null)" = "$J" ] && exit 0
+          echo "$J" > heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -q -m "Signe de vie $J"
+          git push -q || true

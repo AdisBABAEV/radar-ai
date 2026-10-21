@@ -1,0 +1,11 @@
+{
+  "cible": "AdisBABAEV/AGENT_TIKTOK",
+  "score_min": 7,
+  "suivi_h": 3,
+  "max_par_jour": 2,
+  "pause_min": 45,
+  "exclure": [
+    "ligue", "football", "match", "mercato", "champions", "tennis", "rugby", "formule",
+    "basket", "cyclisme", "horoscope", "meteo", "loto", "euromillions"
+  ]
+}
