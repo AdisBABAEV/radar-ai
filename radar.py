@@ -15,6 +15,7 @@ mots exclus (sport, météo…). Réglages : radar.config.json. État : state.js
 
     python radar.py              # déclenche vraiment si AGENT_TOKEN est défini
     python radar.py --essai      # affiche les candidats et leur score, sans rien déclencher
+    python radar.py --verifier   # teste le jeton AGENT_TOKEN auprès de GitHub, sans rien déclencher
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import os
 import re
 import sys
 import unicodedata
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -109,29 +111,65 @@ def charger(nom: str, defaut):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else defaut
 
 
-def declencher(cfg: dict, info: dict, signaux: str) -> None:
+JETON_REFUSE = (
+    "  ✗ GitHub refuse le jeton du radar (HTTP {code}) : il est supprimé, expiré ou sans la permission « Actions : Read and write »\n"
+    "    sur {cible}. Crée un nouveau jeton et remplace la ligne AGENT_TOKEN= du fichier .env du radar, puis teste : python3 radar.py --verifier"
+)
+
+
+def appel_github(cfg: dict, chemin: str, corps: dict | None = None) -> int:
     jeton = os.environ.get("AGENT_TOKEN")
     cible = os.environ.get("CIBLE") or cfg["cible"]
-    if not jeton:
-        print("  (pas de AGENT_TOKEN : déclenchement simulé)")
-        return
-    corps = json.dumps({"ref": "main", "inputs": {"sujet": info["titre"][:250], "liens": "\n".join(info["liens"]), "signaux": signaux[:250]}}).encode()
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{cible}/actions/workflows/flash.yml/dispatches",
-        data=corps,
-        method="POST",
+        f"https://api.github.com/repos/{cible}/{chemin}",
+        data=json.dumps(corps).encode() if corps is not None else None,
+        method="POST" if corps is not None else "GET",
         headers={"Authorization": f"Bearer {jeton}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=20) as r:
-        print(f"  → workflow Flash déclenché sur {cible} (HTTP {r.status})")
+        return r.status
+
+
+def declencher(cfg: dict, info: dict, signaux: str) -> bool:
+    """Lance le workflow Flash. Renvoie False si GitHub refuse (le sujet sera retenté au passage suivant)."""
+    cible = os.environ.get("CIBLE") or cfg["cible"]
+    if not os.environ.get("AGENT_TOKEN"):
+        print("  (pas de AGENT_TOKEN : déclenchement simulé)")
+        return True
+    corps = {"ref": "main", "inputs": {"sujet": info["titre"][:250], "liens": "\n".join(info["liens"]), "signaux": signaux[:250]}}
+    try:
+        statut = appel_github(cfg, "actions/workflows/flash.yml/dispatches", corps)
+    except urllib.error.HTTPError as e:
+        print(JETON_REFUSE.format(code=e.code, cible=cible) if e.code in (401, 403, 404) else f"  ✗ GitHub : erreur HTTP {e.code}, nouvel essai au prochain passage.")
+        return False
+    except OSError as e:
+        print(f"  ✗ GitHub injoignable ({e}) : nouvel essai au prochain passage.")
+        return False
+    print(f"  → workflow Flash déclenché sur {cible} (HTTP {statut})")
+    return True
+
+
+def verifier(cfg: dict) -> None:
+    """Teste le jeton sans rien déclencher : lecture du workflow Flash du dépôt de production."""
+    cible = os.environ.get("CIBLE") or cfg["cible"]
+    if not os.environ.get("AGENT_TOKEN"):
+        sys.exit("✗ Aucun AGENT_TOKEN (fichier .env du radar ou secret GitHub).")
+    try:
+        appel_github(cfg, "actions/workflows/flash.yml")
+    except urllib.error.HTTPError as e:
+        sys.exit(JETON_REFUSE.format(code=e.code, cible=cible))
+    print(f"✓ Jeton du radar accepté par GitHub ({cible}). Vérifie qu'il a bien « Actions : Read and write » pour pouvoir déclencher.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--essai", action="store_true", help="affiche les scores sans rien déclencher ni mémoriser")
+    ap.add_argument("--verifier", action="store_true", help="teste le jeton AGENT_TOKEN auprès de GitHub")
     a = ap.parse_args()
     charger_env()
     cfg = charger("radar.config.json", {})
+    if a.verifier:
+        return verifier(cfg)
     etat = charger("state.json", {"vus": [], "flashs": []})
     t = maintenant()
 
@@ -193,9 +231,9 @@ def main() -> None:
                     continue
                 signaux = f"{len(set(c['medias']))} médias ({', '.join(x for x in c['medias'] if x)})" + (", recherches en hausse" if c["trend"] else "") + (", tendance X" if c["x"] else "")
                 print(f"FLASH : {c['titre']} ({signaux})")
-                declencher(cfg, c, signaux)
-                c["connu"]["flash"] = True
-                flashs.append({"titre": c["titre"], "le": t.isoformat()})
+                if declencher(cfg, c, signaux):
+                    c["connu"]["flash"] = True
+                    flashs.append({"titre": c["titre"], "le": t.isoformat()})
                 break
             else:
                 print("Rien d'assez chaud.")
