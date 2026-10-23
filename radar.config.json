@@ -1,6 +1,6 @@
 {
   "cible": "AdisBABAEV/AGENT_TIKTOK",
-  "score_min": 7,
+  "score_min": 8,
   "suivi_h": 3,
   "max_par_jour": 8,
   "pause_min": 20,
@@ -16,8 +16,33 @@
     "basket",
     "cyclisme",
     "horoscope",
-    "meteo",
     "loto",
     "euromillions"
+  ],
+  "fraicheur_h": 6,
+  "prioritaires": [
+    {
+      "nom": "Cerfia",
+      "x": "CerfiaFR"
+    },
+    {
+      "nom": "Impact",
+      "x": "ImpactMediaFR"
+    },
+    {
+      "nom": "AlertesInfos",
+      "x": "AlertesInfos",
+      "telegram": "AlertesInfos"
+    },
+    {
+      "nom": "franceinfo",
+      "x": "franceinfo",
+      "alertes_seulement": true
+    },
+    {
+      "nom": "BFMTV",
+      "x": "BFMTV",
+      "alertes_seulement": true
+    }
   ]
 }

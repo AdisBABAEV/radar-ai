@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Radar d'actu : toutes les 10 minutes, repère une info qui VIENT d'apparaître et qui monte vite, puis déclenche
-le workflow « Flash actu » du dépôt de production (vidéo prête à publier + notification).
+Radar d'actu : repère une info DU JOUR qui vient d'apparaître, qui est reprise partout et qui touche directement
+le spectateur (argent, droits, transports, sécurité…), puis déclenche le workflow « Flash actu » du dépôt de
+production (vérification par Claude, puis notification « Flash à valider »).
 
-Signaux (gratuits, publics) :
-  - Google Actualités « À la une » (France) : chaque info est regroupée avec les médias qui la reprennent (jusqu'à 5) ;
-  - Google Trends (recherches en forte hausse en France) ;
-  - tendances X en France (classement public).
+Sources (gratuites, publiques) : Google Actualités (à la une, France, Économie) + flux « à la une » de franceinfo,
+Le Monde, 20 Minutes, BFMTV, Le Figaro, Le Parisien, Ouest-France ; recherches en hausse (Google Trends) ;
+tendances X en France.
 
-Score d'une info nouvelle = médias qui la reprennent (1-5) + 2 si elle est dans les recherches en hausse
-+ 2 si elle est en tendance X + 1 si elle est dans le top 10 de Google Actualités. Flash si score ≥ score_min.
-Garde-fous : jamais au premier passage (on mémorise l'existant), pause entre deux flashs, plafond par jour,
-mots exclus (sport, météo…). Réglages : radar.config.json. État : state.json (cache GitHub Actions).
+Les articles de toutes les sources sont regroupés par sujet. Pour chaque sujet NOUVEAU (né il y a moins de
+`fraicheur_h` heures, jamais vu par le radar avant) :
+  score = médias distincts qui en parlent (max 10) + 5 si un compte d'alerte prioritaire l'a posté (Cerfia,
+          Mediavenir, AlertesInfos, Conflits…) + 3 si impact direct sur le spectateur (mots d'impact)
+          + 1 si annonce officielle (gouvernement, Macron, ministre…) + 2 si recherches en hausse + 2 si tendance X
+          + 1 si né il y a moins d'1 h 30.
+Flash si score ≥ score_min. Garde-fous : jamais au premier passage (on mémorise l'existant), pause entre deux
+flashs, plafond par jour, sujets exclus (sport, people, télé…). Le tri fin (déjà traité ? vraiment d'aujourd'hui ?
+hook possible ?) est fait ensuite par Claude dans le workflow Flash.
 
     python radar.py              # déclenche vraiment si AGENT_TOKEN est défini
-    python radar.py --essai      # affiche les candidats et leur score, sans rien déclencher
+    python radar.py --essai      # affiche les sujets et leur score, sans rien déclencher ni mémoriser
+    python radar.py --essai --tout   # idem en notant TOUS les sujets frais (réglage du score)
     python radar.py --verifier   # teste le jeton AGENT_TOKEN auprès de GitHub, sans rien déclencher
 """
 from __future__ import annotations
@@ -35,52 +41,290 @@ from pathlib import Path
 
 ICI = Path(__file__).resolve().parent
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+VERSION_ETAT = 2
 MOTS_VIDES = set(
     "alors apres avant avec aussi autre aux bien cela cette ceux chez comme dans depuis des deux elle elles encore entre "
     "est etait etre fait faire font ils leur leurs mais meme moins nous pour plus quand que quel quelle qui sans selon "
     "ses son sont sous sur tous tout tres une vers voici vous dont sera seront avoir ete apres-midi ainsi contre lors "
-    "pourquoi comment nouveau nouvelle nouveaux selon france francais francaise direct live video photos info infos".split()
+    "pourquoi comment nouveau nouvelle nouveaux selon france francais francaise direct live video photos info infos "
+    "annonce annonces explique ecoutez regardez".split()
 )
+
+# Flux « à la une » : (nom affiché, URL, type). Les flux Google regroupent déjà plusieurs médias par sujet.
+FLUX = [
+    ("Google Actualités", "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr", "google"),
+    ("Google France", "https://news.google.com/rss/headlines/section/topic/NATION?hl=fr&gl=FR&ceid=FR:fr", "google"),
+    ("Google Économie", "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=fr&gl=FR&ceid=FR:fr", "google"),
+    ("franceinfo", "https://www.francetvinfo.fr/titres.rss", "media"),
+    ("Le Monde", "https://www.lemonde.fr/rss/une.xml", "media"),
+    ("20 Minutes", "https://www.20minutes.fr/feeds/rss-une.xml", "media"),
+    ("BFMTV", "https://www.bfmtv.com/rss/news-24-7/", "media"),
+    ("Le Figaro", "https://www.lefigaro.fr/rss/figaro_actualites.xml", "media"),
+    ("Le Parisien", "https://feeds.leparisien.fr/leparisien/rss", "media"),
+    ("Ouest-France", "https://www.ouest-france.fr/rss/une", "media"),
+    ("Libération", "https://www.liberation.fr/arc/outboundfeeds/rss-all/collection/accueil-une/?outputType=xml", "media"),
+    ("TF1 Info / LCI", "https://www.tf1info.fr/feeds/rss-une.xml", "media"),
+    ("CNEWS", "https://www.cnews.fr/rss.xml", "media"),
+    ("Europe 1", "https://www.europe1.fr/rss.xml", "media"),
+    ("France Inter", "https://www.radiofrance.fr/franceinter/rss", "media"),
+    ("L'Express", "https://www.lexpress.fr/arc/outboundfeeds/rss/alaune.xml", "media"),
+    ("Mediapart", "https://www.mediapart.fr/articles/feed", "media"),
+    ("RFI", "https://www.rfi.fr/fr/rss", "media"),
+    ("France 24", "https://www.france24.com/fr/rss", "media"),
+    ("Courrier international", "https://www.courrierinternational.com/feed/all/rss.xml", "media"),
+    # flux directs bloqués : on passe par Google Actualités
+    ("Les Echos", "https://news.google.com/rss/search?q=site:lesechos.fr+when:1d&hl=fr&gl=FR&ceid=FR:fr", "media"),
+    ("Le Point", "https://news.google.com/rss/search?q=site:lepoint.fr+when:1d&hl=fr&gl=FR&ceid=FR:fr", "media"),
+    ("AFP", "https://news.google.com/rss/search?q=AFP+when:1d&hl=fr&gl=FR&ceid=FR:fr", "google"),
+]
+
+# Comptes d'alerte PRIORITAIRES (réglables dans radar.config.json → "prioritaires") :
+#   - "telegram" : chaîne publique lue gratuitement (t.me/s/<nom>) ;
+#   - "x" : compte X lu par l'API officielle X, seulement si X_BEARER_TOKEN est défini (payant à l'usage).
+#   - "alertes_seulement" : seuls les posts « ALERTE / FLASH / URGENT… » sont prioritaires (comptes très prolifiques).
+PRIORITAIRES_DEFAUT = [
+    {"nom": "Cerfia", "x": "CerfiaFR"},
+    {"nom": "Impact", "x": "ImpactMediaFR"},
+    {"nom": "AlertesInfos", "x": "AlertesInfos", "telegram": "AlertesInfos"},
+    {"nom": "franceinfo", "x": "franceinfo", "alertes_seulement": True},
+    {"nom": "BFMTV", "x": "BFMTV", "alertes_seulement": True},
+]
+ALERTE = re.compile(r"\b(?:FLASH|ALERTE|URGENT|BREAKING|DERNI[ÈE]RE\s+MINUTE)\b")
+
+# Ce qui fait une vidéo à la « Bonne Question » : l'info touche directement le spectateur.
+IMPACT = (
+    "argent prix hausse baisse taxe taxes impot impots amende amendes interdit interdite interdiction interdits gratuit gratuite "
+    "rembourse remboursement remboursements aide aides allocation allocations chomage unedic retraite retraites smic salaire "
+    "salaires loyer loyers essence gazole carburant carburants electricite facture factures grève greve greves sncf train trains "
+    "tgv ter metro rer bus avion vols aeroport ecole ecoles college lycee bac eleves permis police gendarmerie prison condamne "
+    "condamnes condamnation tribunal couvre-feu manifestation manifestations loi decret milliards millions euros record penurie "
+    "fermeture fermetures suppression supprime supprimes coupure panne pannes alerte vigilance tempete inondation evacuation "
+    "cambriolage pillage pillages arnaque arnaques fraude hopital urgences vaccin virus epidemie securite sociale mutuelle "
+    "banque compte comptes livret epargne inflation budget impose obligatoire sanction sanctions"
+).split()
+OFFICIEL = "macron gouvernement ministre ministres lecornu prefet prefecture elysee matignon conseil assemblee senat decret discours".split()
+EXCLURE_DEFAUT = [
+    # sport
+    "ligue", "football", "foot ", "match", "mercato", "champions", "tennis", "rugby", "formule 1", "basket", "cyclisme",
+    "tour de france", "psg", "olympique", "transfert", "entraineur", "buteur", "jo 20",
+    # people, télé, culture
+    "star academy", "diaporama", "telerealite", "tele-realite", "koh-lanta", "mariage", "divorce", "chanteur", "chanteuse",
+    "actrice", "acteur", "serie ", "netflix", "film ", "festival", "concert", "album", "people", "princesse", "prince ",
+    "horoscope", "loto", "euromillions", "recette", "jeu video", "jeux video", "cyberpunk", "playstation", "bioware",
+    "les sims", "nintendo", "xbox", "streameur", "youtubeur", "influenceuse", "influenceur",
+]
 
 
 def maintenant() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def lire(url: str) -> str:
+def lire(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"})
     with urllib.request.urlopen(req, timeout=20) as r:
-        return r.read().decode("utf-8", errors="replace")
+        return r.read()
+
+
+def normaliser(texte: str) -> str:
+    t = unicodedata.normalize("NFKD", texte.lower())
+    return "".join(c for c in t if not unicodedata.combining(c))
 
 
 def mots(texte: str) -> set[str]:
-    t = unicodedata.normalize("NFKD", texte.lower())
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    return {w for w in re.findall(r"[a-z0-9]+", t) if len(w) >= 4 and w not in MOTS_VIDES}
+    return {w for w in re.findall(r"[a-z0-9]+", normaliser(texte)) if len(w) >= 4 and w not in MOTS_VIDES}
 
 
 def proche(a: set[str], b: set[str]) -> bool:
-    """Même info ? (titres qui changent d'une heure à l'autre)"""
+    """Même sujet ? (les titres changent d'un média et d'une heure à l'autre)"""
     if not a or not b:
         return False
     commun = len(a & b)
     return commun >= 3 or commun / min(len(a), len(b)) >= 0.5
 
 
-def google_actualites() -> list[dict]:
-    root = ET.fromstring(lire("https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr"))
-    infos = []
-    for rang, it in enumerate(root.iter("item"), 1):
-        desc = it.findtext("description") or ""
-        medias = [html.unescape(m) for m in re.findall(r'<font color="#6f6f6f">(.*?)</font>', desc)]
-        liens = re.findall(r'<a href="([^"]+)"', desc)
-        titre = re.sub(r"\s+-\s+[^-]+$", "", html.unescape(it.findtext("title") or ""))
+def date_de(it) -> datetime | None:
+    for balise in ("pubDate", "{http://purl.org/dc/elements/1.1/}date"):
+        v = it.findtext(balise)
+        if v:
+            try:
+                d = parsedate_to_datetime(v)
+            except (TypeError, ValueError):
+                try:
+                    d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    return None
+
+
+def articles(fraicheur: timedelta, t: datetime) -> tuple[list[dict], list[str]]:
+    """Tous les articles récents de toutes les sources (titre, médias, lien, date)."""
+    out, erreurs = [], []
+    for nom, url, genre in FLUX:
         try:
-            date = parsedate_to_datetime(it.findtext("pubDate") or "")
-        except (TypeError, ValueError):
-            date = None
-        infos.append({"rang": rang, "titre": titre, "medias": medias or [None], "liens": liens[:3] or [it.findtext("link")], "date": date})
-    return infos
+            racine = ET.fromstring(lire(url))
+        except Exception as e:
+            erreurs.append(f"{nom} ({type(e).__name__})")
+            continue
+        for rang, it in enumerate(racine.iter("item"), 1):
+            titre = html.unescape(it.findtext("title") or "").strip()
+            if not titre:
+                continue
+            date = date_de(it)
+            if date and t - date > fraicheur * 4:  # beaucoup trop vieux pour compter, même comme reprise
+                continue
+            if genre == "google":
+                desc = it.findtext("description") or ""
+                medias = [html.unescape(m) for m in re.findall(r'<font color="#6f6f6f">(.*?)</font>', desc)]
+                liens = re.findall(r'<a href="([^"]+)"', desc)[:3] or [it.findtext("link")]
+                titre = re.sub(r"\s+-\s+[^-]+$", "", titre)
+            else:
+                medias, liens = [nom], [it.findtext("link")]
+            out.append({"titre": titre, "medias": medias or [nom], "liens": [x for x in liens if x], "date": date,
+                        "une": genre == "google" and nom == "Google Actualités" and rang <= 10, "mots": mots(titre)})
+    return out, erreurs
+
+
+def nettoyer_alerte(texte: str) -> str:
+    """« 🇫🇷 FLASH - L'État voudrait… » → « L'État voudrait… » (sans drapeaux, émojis ni préfixe d'alerte)."""
+    t = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", " ", texte)
+    t = re.sub(r"^\s*(?:[A-Za-zÀ-ÿ ]+\(Twitter\)\s*)?(?:FLASH|ALERTE(?:\s+INFO)?|URGENT|INFO|BREAKING|DERNI[ÈE]RE\s+MINUTE)\s*[-:–—]\s*", "", t.strip(), flags=re.I)
+    t = re.sub(r"https?://\S+|pic\.twitter\.com/\S+|#\w+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def telegram(chaine: str) -> list[tuple[str, datetime, str]]:
+    """Derniers messages d'une chaîne Telegram publique : (texte, date, lien)."""
+    page = lire(f"https://t.me/s/{chaine}").decode("utf-8", errors="replace")
+    out = []
+    for bloc in re.findall(r'<div class="tgme_widget_message_wrap.*?</time>', page, re.S):
+        txt = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', bloc, re.S)
+        quand = re.search(r'<time datetime="([^"]+)"', bloc)
+        lien = re.search(r'<a class="tgme_widget_message_date" href="([^"]+)"', bloc)
+        if txt and quand:
+            texte = html.unescape(re.sub(r"<br\s*/?>", " ", txt.group(1)))
+            out.append((re.sub("<[^>]+>", "", texte), datetime.fromisoformat(quand.group(1)), lien.group(1) if lien else f"https://t.me/{chaine}"))
+    return out
+
+
+def x_api(compte: str, etat: dict) -> list[tuple[str, datetime, str]]:
+    """Derniers posts d'un compte X via l'API officielle (X_BEARER_TOKEN). Ne relit que les posts nouveaux (since_id)."""
+    jeton = os.environ.get("X_BEARER_TOKEN")
+    if not jeton:
+        return []
+    ids = etat.setdefault("x_ids", {})
+    depuis = etat.setdefault("x_depuis", {})
+
+    def get(chemin: str) -> dict:
+        req = urllib.request.Request(f"https://api.x.com/2/{chemin}", headers={"Authorization": f"Bearer {jeton}", "User-Agent": "radar-ai"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    if compte not in ids:
+        ids[compte] = get(f"users/by/username/{compte}")["data"]["id"]
+    q = "max_results=10&exclude=retweets,replies&tweet.fields=created_at"
+    if depuis.get(compte):
+        q += f"&since_id={depuis[compte]}"
+    d = get(f"users/{ids[compte]}/tweets?{q}")
+    posts = d.get("data", [])
+    if posts:
+        depuis[compte] = posts[0]["id"]
+    return [(p["text"], datetime.fromisoformat(p["created_at"].replace("Z", "+00:00")), f"https://x.com/{compte}/status/{p['id']}") for p in posts]
+
+
+def relais_notifications(cfg: dict, etat: dict) -> list[tuple[str, str, datetime, str]]:
+    """Notifications X relayées par un téléphone ou un émulateur Android (MacroDroid → ntfy).
+    Chaque message ntfy = une notification X : titre = nom du compte, texte = le post. Renvoie (compte, texte, date, lien)."""
+    # nom du canal ntfy : dans .env (RELAIS_TOPIC), jamais dans ce dépôt public (sinon n'importe qui pourrait y écrire)
+    topic = os.environ.get("RELAIS_TOPIC") or (cfg.get("relais_notifications") or {}).get("topic")
+    if not topic:
+        return []
+    depuis = etat.get("relais_depuis") or "30m"
+    page = lire(f"https://ntfy.sh/{topic}/json?poll=1&since={depuis}").decode("utf-8", errors="replace")
+    out = []
+    for ligne in page.splitlines():
+        try:
+            m = json.loads(ligne)
+        except ValueError:
+            continue
+        if m.get("event") != "message":
+            continue
+        etat["relais_depuis"] = m["id"]
+        texte = m.get("message") or ""
+        pj = m.get("attachment") or {}
+        if pj.get("url") and (pj.get("size") or 0) < 20000:  # texte envoyé en pièce jointe (encodage) : on le lit
+            try:
+                texte = lire(pj["url"]).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        out.append((m.get("title") or "", texte, datetime.fromtimestamp(m["time"], tz=timezone.utc), m.get("click") or "https://x.com"))
+    return out
+
+
+def alertes(cfg: dict, etat: dict, fraicheur: timedelta, t: datetime) -> tuple[list[dict], list[str]]:
+    """Posts récents des comptes d'alerte prioritaires (X si clé API, sinon Telegram quand il existe)."""
+    out, erreurs = [], []
+    comptes = cfg.get("prioritaires", PRIORITAIRES_DEFAUT)
+
+    def ajouter(c: dict, texte: str, date: datetime, lien: str) -> None:
+        if t - date > fraicheur:
+            return
+        titre = nettoyer_alerte(texte)[:220]
+        if len(titre) < 20:
+            return
+        # Comptes très prolifiques (franceinfo, BFMTV) : seules leurs ALERTES sont prioritaires ; leurs autres posts
+        # comptent comme une simple reprise par un média.
+        prioritaire = not c.get("alertes_seulement") or bool(ALERTE.search(texte[:60]))
+        out.append({"titre": titre, "medias": [c["nom"]], "liens": [lien], "date": date, "une": False, "mots": mots(titre), "prioritaire": prioritaire})
+
+    for c in comptes:
+        posts = []
+        try:
+            if c.get("x") and os.environ.get("X_BEARER_TOKEN"):
+                posts = x_api(c["x"], etat)
+            elif c.get("telegram"):
+                posts = telegram(c["telegram"])
+        except Exception as e:
+            erreurs.append(f"{c['nom']} ({type(e).__name__})")
+            continue
+        for texte, date, lien in posts:
+            ajouter(c, texte, date, lien)
+    # Notifications X relayées (gratuit) : le compte est reconnu au nom affiché en titre de la notification
+    # (jamais dans le texte : « l'impact de… » ne doit pas être pris pour le compte Impact).
+    try:
+        for titre_notif, texte, date, lien in relais_notifications(cfg, etat):
+            tn = normaliser(titre_notif)
+            c = next((c for c in comptes if re.search(rf"\b{re.escape(normaliser(c['nom']))}\b", tn)
+                      or (c.get("x") and re.search(rf"\b{re.escape(normaliser(c['x']))}\b", tn))), None)
+            if c is not None:
+                ajouter(c, texte, date, lien)  # sinon : notification d'un autre compte, ignorée
+    except Exception as e:
+        erreurs.append(f"relais notifications ({type(e).__name__})")
+    return out, erreurs
+
+
+def regrouper(arts: list[dict]) -> list[dict]:
+    """Regroupe les articles qui parlent du même sujet."""
+    sujets: list[dict] = []
+    for a in sorted(arts, key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True):
+        s = next((s for s in sujets if any(proche(a["mots"], m["mots"]) for m in s["membres"])), None)
+        if s is None:
+            sujets.append({"membres": [a]})
+        else:
+            s["membres"].append(a)
+    for s in sujets:
+        m = s["membres"]
+        s["titre"] = max(m, key=lambda x: len(x["medias"]))["titre"]
+        s["mots"] = set().union(*(x["mots"] for x in m))
+        s["medias"] = sorted({md for x in m for md in x["medias"] if md})
+        s["liens"] = [l for x in m for l in x["liens"]][:4]
+        dates = [x["date"] for x in m if x["date"]]
+        s["ne_le"] = min(dates) if dates else None
+        s["une"] = any(x["une"] for x in m)
+        s["prioritaire"] = sorted({x["medias"][0] for x in m if x.get("prioritaire")})
+        if s["prioritaire"]:  # le titre de l'alerte d'abord : c'est l'info telle qu'elle tombe
+            s["titre"] = next(x["titre"] for x in m if x.get("prioritaire"))
+    return sujets
 
 
 def google_trends() -> list[str]:
@@ -89,7 +333,7 @@ def google_trends() -> list[str]:
 
 
 def tendances_x() -> list[str]:
-    page = lire("https://trends24.in/france/")
+    page = lire("https://trends24.in/france/").decode("utf-8", errors="replace")
     carte = re.search(r'<ol class="?trend-card__list"?>(.*?)</ol>', page, re.S)
     if not carte:
         return []
@@ -130,13 +374,13 @@ def appel_github(cfg: dict, chemin: str, corps: dict | None = None) -> int:
         return r.status
 
 
-def declencher(cfg: dict, info: dict, signaux: str) -> bool:
+def declencher(cfg: dict, sujet: dict, signaux: str) -> bool:
     """Lance le workflow Flash. Renvoie False si GitHub refuse (le sujet sera retenté au passage suivant)."""
     cible = os.environ.get("CIBLE") or cfg["cible"]
     if not os.environ.get("AGENT_TOKEN"):
         print("  (pas de AGENT_TOKEN : déclenchement simulé)")
         return True
-    corps = {"ref": "main", "inputs": {"sujet": info["titre"][:250], "liens": "\n".join(info["liens"]), "signaux": signaux[:250]}}
+    corps = {"ref": "main", "inputs": {"sujet": sujet["titre"][:250], "liens": "\n".join(sujet["liens"]), "signaux": signaux[:250]}}
     try:
         statut = appel_github(cfg, "actions/workflows/flash.yml/dispatches", corps)
     except urllib.error.HTTPError as e:
@@ -165,15 +409,23 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--essai", action="store_true", help="affiche les scores sans rien déclencher ni mémoriser")
     ap.add_argument("--verifier", action="store_true", help="teste le jeton AGENT_TOKEN auprès de GitHub")
+    ap.add_argument("--tout", action="store_true", help="avec --essai : note tous les sujets frais, même déjà vus")
     a = ap.parse_args()
     charger_env()
     cfg = charger("radar.config.json", {})
     if a.verifier:
         return verifier(cfg)
-    etat = charger("state.json", {"vus": [], "flashs": []})
     t = maintenant()
+    fraicheur = timedelta(hours=cfg.get("fraicheur_h", 6))
 
-    infos = google_actualites()
+    etat = charger("state.json", {"vus": [], "flashs": []})
+    arts, erreurs = articles(fraicheur, t)
+    prio, erreurs_prio = alertes(cfg, etat, fraicheur, t)
+    arts += prio
+    erreurs += erreurs_prio
+    if erreurs:
+        print("Sources indisponibles : " + ", ".join(erreurs))
+    sujets = regrouper(arts)
     try:
         trends = [mots(q) for q in google_trends()]
     except Exception as e:
@@ -185,38 +437,45 @@ def main() -> None:
         print(f"Tendances X indisponibles : {e}")
         xs = []
 
-    # Mémoire (48 h) : chaque info avec l'heure où le radar l'a vue pour la première fois. Une info est suivie
-    # pendant `suivi_h` heures : elle peut devenir chaude plus tard (de 1 à 5 médias, puis dans les recherches…).
-    vus = [v for v in etat["vus"] if t - datetime.fromisoformat(v["vu_le"]) < timedelta(hours=48)]
-    flashs = [f for f in etat["flashs"] if t - datetime.fromisoformat(f["le"]) < timedelta(hours=24)]
-    premier_passage = not etat["vus"]
-    exclus = [mots(x) for x in cfg.get("exclure", [])]
+    # Mémoire (48 h). Un nouveau format d'état (nouvelles sources) = on réapprend l'existant sans rien déclencher.
+    premier_passage = not etat["vus"] or etat.get("version") != VERSION_ETAT
+    vus = [] if etat.get("version") != VERSION_ETAT else [v for v in etat["vus"] if t - datetime.fromisoformat(v["vu_le"]) < timedelta(hours=48)]
+    flashs = [f for f in etat.get("flashs", []) if t - datetime.fromisoformat(f["le"]) < timedelta(hours=24)]
+    exclus = [normaliser(x) for x in cfg.get("exclure", [])] + EXCLURE_DEFAUT
     suivi = timedelta(hours=cfg.get("suivi_h", 3))
 
     candidats = []
-    for info in infos:
-        m = mots(info["titre"])
-        connu = next((v for v in vus if proche(m, set(v["mots"]))), None)
+    for s in sujets:
+        connu = next((v for v in vus if proche(s["mots"], set(v["mots"])) or any(proche(m["mots"], set(v["mots"])) for m in s["membres"])), None)
         if connu is None:
-            connu = {"mots": sorted(m), "titre": info["titre"], "vu_le": t.isoformat(), "initial": premier_passage, "flash": False}
+            connu = {"mots": sorted(s["mots"])[:40], "titre": s["titre"], "vu_le": t.isoformat(), "initial": premier_passage, "flash": False}
             vus.append(connu)
-        if connu.get("initial") or connu.get("flash") or t - datetime.fromisoformat(connu["vu_le"]) > suivi:
-            continue  # déjà là avant le radar, déjà envoyée, ou trop ancienne
-        medias = len({x for x in info["medias"] if x})
-        en_trend = any(len(m & q) >= 1 for q in trends if q)
-        en_x = any(len(m & q) >= 1 for q in xs if q)
-        score = medias + 2 * en_trend + 2 * en_x + (info["rang"] <= 10)
-        exclue = any(e and e <= m for e in exclus)
-        age = round((t - datetime.fromisoformat(connu["vu_le"])).total_seconds() / 60)
-        candidats.append({**info, "mots": m, "age_min": age, "score": score, "trend": en_trend, "x": en_x, "exclue": exclue, "connu": connu})
+        if not a.tout and (connu.get("initial") or connu.get("flash") or t - datetime.fromisoformat(connu["vu_le"]) > suivi):
+            continue  # déjà là avant le radar, déjà envoyé, ou suivi terminé
+        if s["ne_le"] and t - s["ne_le"] > fraicheur:
+            continue  # sujet qui date : pas une info du jour
+        titre_n = normaliser(" ".join(m["titre"] for m in s["membres"]))
+        impact = sorted({w for w in IMPACT if re.search(rf"\b{re.escape(w)}\b", titre_n)})
+        officiel = any(re.search(rf"\b{w}\b", titre_n) for w in OFFICIEL)
+        en_trend = any(len(s["mots"] & q) >= 2 or (len(q) == 1 and q <= s["mots"]) for q in trends if q)
+        en_x = any(len(s["mots"] & q) >= 2 or (len(q) == 1 and q <= s["mots"]) for q in xs if q)
+        couverture = min(len(s["medias"]), 10)
+        tout_frais = bool(s["ne_le"]) and t - s["ne_le"] < timedelta(minutes=90)
+        couverture = min(len([m for m in s["medias"] if m not in s["prioritaire"]]), 10)
+        score = couverture + 5 * bool(s["prioritaire"]) + 3 * bool(impact) + officiel + 2 * en_trend + 2 * en_x + tout_frais
+        exclue = any(re.search(rf"\b{re.escape(e.strip())}\b", normaliser(s["titre"])) for e in exclus if e.strip())
+        age = round((t - s["ne_le"]).total_seconds() / 60) if s["ne_le"] else None
+        candidats.append({**s, "score": score, "impact": impact, "officiel": officiel, "trend": en_trend, "x": en_x,
+                          "exclue": exclue, "age_min": age, "connu": connu, "couverture": couverture})
 
     candidats.sort(key=lambda c: -c["score"])
-    for c in candidats[:8]:
-        print(f"  {c['score']:>2} pts · suivie depuis {c['age_min']:>3} min · {len(set(c['medias']))} médias{' · recherches' if c['trend'] else ''}"
-              f"{' · X' if c['x'] else ''}{' · EXCLUE' if c['exclue'] else ''} · {c['titre'][:90]}")
+    for c in candidats[: 25 if a.tout else 8]:
+        age = f"né il y a {c['age_min']:>3} min" if c["age_min"] is not None else "date inconnue"
+        print(f"  {c['score']:>2} pts · {age} · {c['couverture']} médias{' · ALERTE ' + '+'.join(c['prioritaire']) if c['prioritaire'] else ''}{' · impact' if c['impact'] else ''}{' · officiel' if c['officiel'] else ''}"
+              f"{' · recherches' if c['trend'] else ''}{' · X' if c['x'] else ''}{' · EXCLU' if c['exclue'] else ''} · {c['titre'][:90]}")
 
     if premier_passage:
-        print(f"Premier passage : {len(vus)} infos mémorisées, aucun flash.")
+        print(f"Premier passage : {len(vus)} sujets mémorisés, aucun flash.")
     elif a.essai:
         print("Mode essai : rien n'est déclenché.")
     else:
@@ -229,7 +488,10 @@ def main() -> None:
             for c in candidats:
                 if c["exclue"] or c["score"] < cfg.get("score_min", 7):
                     continue
-                signaux = f"{len(set(c['medias']))} médias ({', '.join(x for x in c['medias'] if x)})" + (", recherches en hausse" if c["trend"] else "") + (", tendance X" if c["x"] else "")
+                signaux = ((f"alerte {', '.join(c['prioritaire'])} ; " if c["prioritaire"] else "") + f"{c['couverture']} médias ({', '.join(c['medias'][:6])})"
+                           + (f", impact : {', '.join(c['impact'][:4])}" if c["impact"] else "")
+                           + (", annonce officielle" if c["officiel"] else "") + (", recherches en hausse" if c["trend"] else "")
+                           + (", tendance X" if c["x"] else "") + (f", né il y a {c['age_min']} min" if c["age_min"] is not None else ""))
                 print(f"FLASH : {c['titre']} ({signaux})")
                 if declencher(cfg, c, signaux):
                     c["connu"]["flash"] = True
@@ -239,7 +501,9 @@ def main() -> None:
                 print("Rien d'assez chaud.")
 
     if not a.essai:
-        (ICI / "state.json").write_text(json.dumps({"vus": vus[-400:], "flashs": flashs}, ensure_ascii=False), encoding="utf-8")
+        (ICI / "state.json").write_text(json.dumps({"version": VERSION_ETAT, "vus": vus[-800:], "flashs": flashs,
+                                                     "x_ids": etat.get("x_ids", {}), "x_depuis": etat.get("x_depuis", {}),
+                                                     "relais_depuis": etat.get("relais_depuis")}, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

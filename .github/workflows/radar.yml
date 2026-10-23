@@ -34,6 +34,7 @@ jobs:
       - name: Chercher une info chaude
         env:
           AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           CIBLE: ${{ vars.CIBLE }}
         run: python3 radar.py
 
