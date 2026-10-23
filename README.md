@@ -17,6 +17,7 @@ Ce dépôt est public pour profiter des minutes GitHub Actions gratuites : il ne
 ## Sources
 - **Prioritaires — comptes d'alerte** (`prioritaires`) : Cerfia, Impact (@ImpactMediaFR), AlertesInfos, franceinfo, BFMTV.
   Un post de leur part vaut **+5 points** : une alerte du jour qui touche le spectateur déclenche un flash dans les 2 minutes.
+  Leurs alertes passent **en premier**, avec leur propre quota : les autres sujets ne peuvent jamais les bloquer.
   Pour franceinfo et BFMTV (`alertes_seulement`), seuls les posts « ALERTE / FLASH / URGENT » sont prioritaires ; leurs
   autres posts comptent comme une simple reprise.
   - lus par l'**API officielle X** si `X_BEARER_TOKEN` est défini (`.env` du radar sur le PC, ou secret GitHub) ;
@@ -34,10 +35,12 @@ Ce dépôt est public pour profiter des minutes GitHub Actions gratuites : il ne
 |---|---|
 | `cible` | dépôt de production (`propriétaire/nom`) |
 | `prioritaires` | comptes d'alerte : `{ "nom", "x": "<compte X>", "telegram": "<chaîne>" }` |
-| `score_min` | seuil de déclenchement (défaut 8). Score = médias distincts (max 10) + 5 si alerte d'un compte prioritaire + 3 si impact direct sur le spectateur + 1 si annonce officielle + 2 si recherches en hausse + 2 si tendance X + 1 si né il y a moins d'1 h 30. Baisser = plus de flashs |
+| `score_min` | seuil d'une **alerte d'un compte prioritaire** (défaut 8). Score = médias distincts (max 10) + 5 si alerte d'un compte prioritaire + 3 si impact direct sur le spectateur + 1 si annonce officielle + 2 si recherches en hausse + 2 si tendance X + 1 si né il y a moins d'1 h 30. Baisser = plus de flashs |
+| `score_min_autres` | seuil des **autres sujets**, sans alerte d'un compte prioritaire (défaut 11 : seulement l'actu reprise partout) |
+| `max_alertes_par_jour`, `pause_alertes_min` | quota d'alertes prioritaires par 24 h (défaut 6) et pause minimale avant l'une d'elles (défaut 10 min) |
+| `max_autres_par_jour`, `pause_min` | quota des autres sujets par 24 h (défaut 3) et pause avant l'un d'eux (défaut 20 min). Garde-fous pour ton quota Claude (le dépôt de production a aussi son propre plafond) |
 | `fraicheur_h` | âge maximum d'un sujet (heures) : seules les infos du jour comptent |
 | `suivi_h` | pendant combien d'heures un nouveau sujet est surveillé (il peut devenir chaud plus tard) |
-| `max_par_jour`, `pause_min` | garde-fous pour ton quota Claude (le dépôt de production a aussi son propre plafond) |
 | `exclure` | mots qui écartent un sujet (en plus du sport, du people et de la télé exclus d'office) |
 
 Tester sans rien déclencher : `python radar.py --essai` (ou `--essai --tout` pour noter tous les sujets frais).

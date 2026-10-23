@@ -11,12 +11,14 @@ tendances X en France.
 Les articles de toutes les sources sont regroupés par sujet. Pour chaque sujet NOUVEAU (né il y a moins de
 `fraicheur_h` heures, jamais vu par le radar avant) :
   score = médias distincts qui en parlent (max 10) + 5 si un compte d'alerte prioritaire l'a posté (Cerfia,
-          Mediavenir, AlertesInfos, Conflits…) + 3 si impact direct sur le spectateur (mots d'impact)
+          Impact, AlertesInfos, franceinfo, BFMTV) + 3 si impact direct sur le spectateur (mots d'impact)
           + 1 si annonce officielle (gouvernement, Macron, ministre…) + 2 si recherches en hausse + 2 si tendance X
           + 1 si né il y a moins d'1 h 30.
-Flash si score ≥ score_min. Garde-fous : jamais au premier passage (on mémorise l'existant), pause entre deux
-flashs, plafond par jour, sujets exclus (sport, people, télé…). Le tri fin (déjà traité ? vraiment d'aujourd'hui ?
-hook possible ?) est fait ensuite par Claude dans le workflow Flash.
+Les alertes des comptes prioritaires passent en premier : flash dès score_min, avec leur propre quota par 24 h.
+Les autres sujets (simple reprise par les médias) demandent score_min_autres et ont un petit quota à part : ils ne
+bloquent jamais une alerte. Garde-fous : jamais au premier passage (on mémorise l'existant), pause entre deux flashs,
+sujets exclus (sport, people, télé…). Le tri fin (déjà traité ? vraiment d'aujourd'hui ? hook possible ?) est fait
+ensuite par Claude dans le workflow Flash.
 
     python radar.py              # déclenche vraiment si AGENT_TOKEN est défini
     python radar.py --essai      # affiche les sujets et leur score, sans rien déclencher ni mémoriser
@@ -454,12 +456,11 @@ def main() -> None:
             continue  # déjà là avant le radar, déjà envoyé, ou suivi terminé
         if s["ne_le"] and t - s["ne_le"] > fraicheur:
             continue  # sujet qui date : pas une info du jour
-        titre_n = normaliser(" ".join(m["titre"] for m in s["membres"]))
+        titre_n = re.sub(r"\ben train de\b", " ", normaliser(" ".join(m["titre"] for m in s["membres"])))  # « en train de » ≠ un train
         impact = sorted({w for w in IMPACT if re.search(rf"\b{re.escape(w)}\b", titre_n)})
         officiel = any(re.search(rf"\b{w}\b", titre_n) for w in OFFICIEL)
         en_trend = any(len(s["mots"] & q) >= 2 or (len(q) == 1 and q <= s["mots"]) for q in trends if q)
         en_x = any(len(s["mots"] & q) >= 2 or (len(q) == 1 and q <= s["mots"]) for q in xs if q)
-        couverture = min(len(s["medias"]), 10)
         tout_frais = bool(s["ne_le"]) and t - s["ne_le"] < timedelta(minutes=90)
         couverture = min(len([m for m in s["medias"] if m not in s["prioritaire"]]), 10)
         score = couverture + 5 * bool(s["prioritaire"]) + 3 * bool(impact) + officiel + 2 * en_trend + 2 * en_x + tout_frais
@@ -479,26 +480,31 @@ def main() -> None:
     elif a.essai:
         print("Mode essai : rien n'est déclenché.")
     else:
+        # Les alertes des comptes prioritaires passent d'abord, avec leur propre quota : les autres sujets (simple
+        # reprise par les médias) ont un seuil plus haut et un petit quota à part, ils ne peuvent jamais les bloquer.
         dernier = max((datetime.fromisoformat(f["le"]) for f in flashs), default=None)
-        if len(flashs) >= cfg.get("max_par_jour", 4):
-            print("Plafond de flashs atteint pour 24 h.")
-        elif dernier and t - dernier < timedelta(minutes=cfg.get("pause_min", 45)):
-            print("Pause entre deux flashs.")
+        depuis = t - dernier if dernier else timedelta(days=1)
+        n_alertes = sum(1 for f in flashs if f.get("alerte"))
+        alertes_ok = n_alertes < cfg.get("max_alertes_par_jour", 6) and depuis >= timedelta(minutes=cfg.get("pause_alertes_min", 10))
+        autres_ok = len(flashs) - n_alertes < cfg.get("max_autres_par_jour", 3) and depuis >= timedelta(minutes=cfg.get("pause_min", 20))
+        elus = [c for c in candidats if not c["exclue"] and (
+            (c["prioritaire"] and alertes_ok and c["score"] >= cfg.get("score_min", 8))
+            or (not c["prioritaire"] and autres_ok and c["score"] >= cfg.get("score_min_autres", 11)))]
+        elus.sort(key=lambda c: (not c["prioritaire"], -c["score"]))
+        if elus:
+            c = elus[0]
+            signaux = ((f"alerte {', '.join(c['prioritaire'])} ; " if c["prioritaire"] else "") + f"{c['couverture']} médias ({', '.join(c['medias'][:6])})"
+                       + (f", impact : {', '.join(c['impact'][:4])}" if c["impact"] else "")
+                       + (", annonce officielle" if c["officiel"] else "") + (", recherches en hausse" if c["trend"] else "")
+                       + (", tendance X" if c["x"] else "") + (f", né il y a {c['age_min']} min" if c["age_min"] is not None else ""))
+            print(f"FLASH : {c['titre']} ({signaux})")
+            if declencher(cfg, c, signaux):
+                c["connu"]["flash"] = True
+                flashs.append({"titre": c["titre"], "le": t.isoformat(), "alerte": bool(c["prioritaire"])})
         else:
-            for c in candidats:
-                if c["exclue"] or c["score"] < cfg.get("score_min", 7):
-                    continue
-                signaux = ((f"alerte {', '.join(c['prioritaire'])} ; " if c["prioritaire"] else "") + f"{c['couverture']} médias ({', '.join(c['medias'][:6])})"
-                           + (f", impact : {', '.join(c['impact'][:4])}" if c["impact"] else "")
-                           + (", annonce officielle" if c["officiel"] else "") + (", recherches en hausse" if c["trend"] else "")
-                           + (", tendance X" if c["x"] else "") + (f", né il y a {c['age_min']} min" if c["age_min"] is not None else ""))
-                print(f"FLASH : {c['titre']} ({signaux})")
-                if declencher(cfg, c, signaux):
-                    c["connu"]["flash"] = True
-                    flashs.append({"titre": c["titre"], "le": t.isoformat()})
-                break
-            else:
-                print("Rien d'assez chaud.")
+            print(f"Rien d'assez chaud. Alertes prioritaires : {n_alertes}/{cfg.get('max_alertes_par_jour', 6)} en 24 h"
+                  f"{'' if alertes_ok else ' (en pause ou plafond)'} · autres sujets : {len(flashs) - n_alertes}/{cfg.get('max_autres_par_jour', 3)}"
+                  f"{'' if autres_ok else ' (en pause ou plafond)'}.")
 
     if not a.essai:
         (ICI / "state.json").write_text(json.dumps({"version": VERSION_ETAT, "vus": vus[-800:], "flashs": flashs,

@@ -1,8 +1,11 @@
 {
   "cible": "AdisBABAEV/AGENT_TIKTOK",
   "score_min": 8,
+  "score_min_autres": 11,
   "suivi_h": 3,
-  "max_par_jour": 8,
+  "max_alertes_par_jour": 6,
+  "max_autres_par_jour": 3,
+  "pause_alertes_min": 10,
   "pause_min": 20,
   "exclure": [
     "ligue",
