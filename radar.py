@@ -363,17 +363,33 @@ JETON_REFUSE = (
 )
 
 
-def appel_github(cfg: dict, chemin: str, corps: dict | None = None) -> int:
+def appel_github(cfg: dict, chemin: str, corps: dict | None = None) -> tuple[int, dict]:
     jeton = os.environ.get("AGENT_TOKEN")
     cible = os.environ.get("CIBLE") or cfg["cible"]
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{cible}/{chemin}",
+        f"https://api.github.com/repos/{cible}" + (f"/{chemin}" if chemin else ""),
         data=json.dumps(corps).encode() if corps is not None else None,
         method="POST" if corps is not None else "GET",
         headers={"Authorization": f"Bearer {jeton}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=20) as r:
-        return r.status
+        return r.status, {k.lower(): v for k, v in r.headers.items()}
+
+
+def rapport_sante(cfg: dict, etat: dict, t: datetime) -> None:
+    """Une fois par jour : date d'expiration du jeton du radar, envoyée au workflow « Santé » du dépôt de production, qui
+    prévient sur le téléphone avant qu'il n'expire (et si le radar ne donne plus de nouvelles pendant 2 jours)."""
+    if not os.environ.get("AGENT_TOKEN") or (etat.get("sante_le") and t - datetime.fromisoformat(etat["sante_le"]) < timedelta(hours=20)):
+        return
+    try:
+        _, entetes = appel_github(cfg, "")
+        expire = entetes.get("github-authentication-token-expiration") or "jamais"
+        appel_github(cfg, "actions/workflows/sante.yml/dispatches",
+                     {"ref": "main", "inputs": {"radar_expire": expire, "radar_lieu": os.environ.get("RADAR_LIEU", "PC")}})
+        etat["sante_le"] = t.isoformat()
+        print(f"Rapport santé envoyé (jeton du radar : expire {expire}).")
+    except (urllib.error.HTTPError, OSError) as e:
+        print(f"Rapport santé impossible ({e}) : nouvel essai au prochain passage.")
 
 
 def declencher(cfg: dict, sujet: dict, signaux: str) -> bool:
@@ -384,7 +400,7 @@ def declencher(cfg: dict, sujet: dict, signaux: str) -> bool:
         return True
     corps = {"ref": "main", "inputs": {"sujet": sujet["titre"][:250], "liens": "\n".join(sujet["liens"]), "signaux": signaux[:250]}}
     try:
-        statut = appel_github(cfg, "actions/workflows/flash.yml/dispatches", corps)
+        statut, _ = appel_github(cfg, "actions/workflows/flash.yml/dispatches", corps)
     except urllib.error.HTTPError as e:
         print(JETON_REFUSE.format(code=e.code, cible=cible) if e.code in (401, 403, 404) else f"  ✗ GitHub : erreur HTTP {e.code}, nouvel essai au prochain passage.")
         return False
@@ -441,6 +457,13 @@ def main() -> None:
 
     # Mémoire (48 h). Un nouveau format d'état (nouvelles sources) = on réapprend l'existant sans rien déclencher.
     premier_passage = not etat["vus"] or etat.get("version") != VERSION_ETAT
+    # Reprise après une pause (PC éteint, ou radar GitHub qui prend le relais) : les sujets apparus pendant la pause sont
+    # mémorisés sans flash, sauf ceux nés il y a moins de 30 min. Sinon : une rafale de flashs sur de l'actu déjà vieille.
+    derniere = etat.get("derniere_passe")
+    pause = t - datetime.fromisoformat(derniere) if derniere else None
+    reprise = not premier_passage and (pause is None or pause > timedelta(minutes=cfg.get("reprise_min", 40)))
+    if reprise:
+        print(f"Reprise après {round(pause.total_seconds() / 60) if pause else '?'} min sans passage : l'actu plus ancienne est mémorisée sans flash.")
     vus = [] if etat.get("version") != VERSION_ETAT else [v for v in etat["vus"] if t - datetime.fromisoformat(v["vu_le"]) < timedelta(hours=48)]
     flashs = [f for f in etat.get("flashs", []) if t - datetime.fromisoformat(f["le"]) < timedelta(hours=24)]
     exclus = [normaliser(x) for x in cfg.get("exclure", [])] + EXCLURE_DEFAUT
@@ -450,7 +473,8 @@ def main() -> None:
     for s in sujets:
         connu = next((v for v in vus if proche(s["mots"], set(v["mots"])) or any(proche(m["mots"], set(v["mots"])) for m in s["membres"])), None)
         if connu is None:
-            connu = {"mots": sorted(s["mots"])[:40], "titre": s["titre"], "vu_le": t.isoformat(), "initial": premier_passage, "flash": False}
+            initial = premier_passage or (reprise and not (s["ne_le"] and t - s["ne_le"] < timedelta(minutes=30)))
+            connu = {"mots": sorted(s["mots"])[:40], "titre": s["titre"], "vu_le": t.isoformat(), "initial": initial, "flash": False}
             vus.append(connu)
         if not a.tout and (connu.get("initial") or connu.get("flash") or t - datetime.fromisoformat(connu["vu_le"]) > suivi):
             continue  # déjà là avant le radar, déjà envoyé, ou suivi terminé
@@ -507,9 +531,11 @@ def main() -> None:
                   f"{'' if autres_ok else ' (en pause ou plafond)'}.")
 
     if not a.essai:
+        rapport_sante(cfg, etat, t)
         (ICI / "state.json").write_text(json.dumps({"version": VERSION_ETAT, "vus": vus[-800:], "flashs": flashs,
                                                      "x_ids": etat.get("x_ids", {}), "x_depuis": etat.get("x_depuis", {}),
-                                                     "relais_depuis": etat.get("relais_depuis")}, ensure_ascii=False), encoding="utf-8")
+                                                     "relais_depuis": etat.get("relais_depuis"), "derniere_passe": t.isoformat(),
+                                                     "sante_le": etat.get("sante_le")}, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

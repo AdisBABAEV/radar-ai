@@ -1,6 +1,9 @@
 # Radar d'actu : toutes les 10 minutes (dépôt public → minutes GitHub Actions gratuites et illimitées).
-# Secret requis : AGENT_TOKEN = jeton GitHub fine-grained limité au dépôt de production, permission Actions: Read and write.
-# Variable facultative : CIBLE = dépôt de production (sinon radar.config.json → "cible").
+# Quand le PC est allumé, son radar (toutes les 2 min) s'en charge : celui-ci ne prend le relais que si le PC est éteint.
+# Secrets : AGENT_TOKEN = jeton GitHub fine-grained limité au dépôt de production, permission Actions: Read and write ;
+#           RUNNERS_TOKEN = jeton limité au dépôt de production, permission Administration: Read-only (pour savoir si le
+#           PC est en ligne ; le même que dans le dépôt de production). Sans lui : variable RADAR_SUR_PC = true → en veille.
+# Variables facultatives : CIBLE = dépôt de production (sinon radar.config.json → "cible") ; MACHINE = label du PC.
 name: Radar actu
 
 on:
@@ -17,29 +20,51 @@ concurrency:
 
 jobs:
   radar:
-    # Quand le radar tourne sur le PC (toutes les 2 min), celui-ci se met en veille : variable RADAR_SUR_PC = true.
-    if: vars.RADAR_SUR_PC != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
+      - name: PC allumé ?
+        id: pc
+        env:
+          GH_TOKEN: ${{ secrets.RUNNERS_TOKEN }}
+          CIBLE: ${{ vars.CIBLE }}
+          MACHINE: ${{ vars.MACHINE || 'agent-pc' }}
+          SUR_PC: ${{ vars.RADAR_SUR_PC }}
+        run: |
+          CIBLE="${CIBLE:-$(jq -r .cible radar.config.json)}"
+          if [ -z "$GH_TOKEN" ]; then
+            [ "$SUR_PC" = "true" ] && ACTIF=non || ACTIF=oui
+            echo "Pas de RUNNERS_TOKEN : RADAR_SUR_PC=$SUR_PC → actif=$ACTIF"
+          else
+            N=$(gh api "repos/$CIBLE/actions/runners" \
+                  --jq "[.runners[] | select(.status == \"online\") | select(any(.labels[]; .name == \"$MACHINE\"))] | length" 2>/dev/null) || N=""
+            if [ -z "$N" ]; then ACTIF=oui; echo "::warning::RUNNERS_TOKEN refusé par GitHub : le radar tourne par prudence."
+            elif [ "$N" -gt 0 ]; then ACTIF=non; echo "PC en ligne : son radar s'en charge."
+            else ACTIF=oui; echo "PC éteint : ce radar prend le relais."; fi
+          fi
+          echo "actif=$ACTIF" >> "$GITHUB_OUTPUT"
+
       # Mémoire des infos déjà vues : gardée dans le cache (pas de commit toutes les 10 minutes).
       - uses: actions/cache/restore@v4
+        if: steps.pc.outputs.actif == 'oui'
         with:
           path: state.json
           key: radar-${{ github.run_id }}
           restore-keys: radar-
 
       - name: Chercher une info chaude
+        if: steps.pc.outputs.actif == 'oui'
         env:
           AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           CIBLE: ${{ vars.CIBLE }}
+          RADAR_LIEU: GitHub
         run: python3 radar.py
 
       - uses: actions/cache/save@v4
-        if: always()
+        if: always() && steps.pc.outputs.actif == 'oui'
         with:
           path: state.json
           key: radar-${{ github.run_id }}

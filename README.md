@@ -14,6 +14,15 @@ Ce dépôt est public pour profiter des minutes GitHub Actions gratuites : il ne
 3. *Actions → Radar actu → Run workflow* pour un premier passage. Le premier passage mémorise l'actu du moment
    sans rien déclencher ; les suivants (toutes les 10 min) déclenchent un flash quand une nouvelle info devient chaude.
 
+## PC allumé ou éteint
+Sur le PC, le radar tourne toutes les 2 minutes (service `radar-actu` dans Ubuntu). Celui de GitHub (toutes les 10 min)
+vérifie d'abord si le PC est en ligne et **ne prend le relais que s'il est éteint** : flashs même PC éteint.
+Il lui faut le secret `RUNNERS_TOKEN` (jeton fine-grained limité au dépôt de production, permission
+**Administration : Read-only**, le même que dans le dépôt de production). Sans lui, la variable `RADAR_SUR_PC = true`
+le met en veille comme avant. Après une pause (PC éteint, relais GitHub), le radar mémorise l'actu apparue entre-temps
+sans flash, sauf ce qui est né il y a moins de 30 min : pas de rafale de flashs sur de l'actu déjà vieille.
+Chaque jour, il envoie la date d'expiration de son jeton au workflow « Santé » du dépôt de production (onglet Santé du site).
+
 ## Sources
 - **Prioritaires — comptes d'alerte** (`prioritaires`) : Cerfia, Impact (@ImpactMediaFR), AlertesInfos, franceinfo, BFMTV.
   Un post de leur part vaut **+5 points** : une alerte du jour qui touche le spectateur déclenche un flash dans les 2 minutes.
@@ -41,6 +50,7 @@ Ce dépôt est public pour profiter des minutes GitHub Actions gratuites : il ne
 | `max_autres_par_jour`, `pause_min` | quota des autres sujets par 24 h (défaut 3) et pause avant l'un d'eux (défaut 20 min). Garde-fous pour ton quota Claude (le dépôt de production a aussi son propre plafond) |
 | `fraicheur_h` | âge maximum d'un sujet (heures) : seules les infos du jour comptent |
 | `suivi_h` | pendant combien d'heures un nouveau sujet est surveillé (il peut devenir chaud plus tard) |
+| `reprise_min` | pause (minutes sans passage) au-delà de laquelle l'actu apparue entre-temps est mémorisée sans flash (défaut 40) |
 | `exclure` | mots qui écartent un sujet (en plus du sport, du people et de la télé exclus d'office) |
 
 Tester sans rien déclencher : `python radar.py --essai` (ou `--essai --tout` pour noter tous les sujets frais).
